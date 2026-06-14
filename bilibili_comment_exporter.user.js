@@ -4,7 +4,7 @@
 // @version      0.1.8
 // @description  一款基于 Bilibili API 的视频评论区导出工具，支持导出主评论和子评论（楼中楼）为 CSV 文件，带有 UTF-8 BOM 解决乱码，并有漂亮的玻璃质感 UI 和实时的 IP 属地、等级及性别数据统计图表。
 // @author       heroxv
-// @icon         https://github.com/heroxv/bilibili-comment-exporter/raw/main/assets/logo.png
+// @icon         https://github.com/heroxv/bilibili-comment-exporter/raw/main/assets/logo.svg
 // @match        *://*.bilibili.com/video/BV*
 // @match        *://*.bilibili.com/video/av*
 // @match        *://space.bilibili.com/*

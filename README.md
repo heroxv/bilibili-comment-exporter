@@ -45,7 +45,7 @@
 ```text
 bilibili-comment-exporter/
 ├── assets/
-│   ├── logo.png                         # 脚本标志图标 (Logo)
+│   ├── logo.svg                         # 脚本标志图标 (Logo)
 │   ├── 导出中.png                       # 导出评论数据中界面
 │   ├── 导出评论按钮.png                 # 页面右下角悬浮按钮
 │   ├── 统计页面.png                     # 数据可视化分析面板
