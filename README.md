@@ -2,16 +2,15 @@
 
 一款运行于浏览器环境的哔哩哔哩（B站）视频评论区导出油猴脚本（Tampermonkey UserScript）。该工具完全移植并适配了由 [WShihan](https://github.com/WShihan) 编写的基于 Go 语言的命令行评论下载工具 [blblcd](https://github.com/WShihan/blblcd) 的核心功能，并在此之上提供了极具现代视觉美感的控制面板及数据统计图表。
 
+[![GitHub Repo stars](https://img.shields.io/github/stars/heroxv/bilibili-comment-exporter?style=plastic) ![GitHub repo size](https://img.shields.io/github/repo-size/heroxv/bilibili-comment-exporter?style=plastic) ![GitHub last commit](https://img.shields.io/github/last-commit/heroxv/bilibili-comment-exporter?style=plastic) ![GitHub](https://img.shields.io/github/license/heroxv/bilibili-comment-exporter?style=plastic) ![GitHub top language](https://img.shields.io/github/languages/top/heroxv/bilibili-comment-exporter?style=plastic)](https://github.com/heroxv/bilibili-comment-exporter)
+
 ---
 
 ### 🔗 关联项目：blblcd (Go 语言命令行下载工具)
 
-本项目基于并适配了下述项目的核心 API 与 CSV 数据结构定义：
+本项目移植自下述项目的核心 API 与 CSV 数据结构定义：
 
-[![GitHub Repo stars](https://img.shields.io/github/stars/WShihan/blblcd?style=plastic) ![GitHub repo size](https://img.shields.io/github/repo-size/WShihan/blblcd?style=plastic) ![GitHub last commit](https://img.shields.io/github/last-commit/WShihan/blblcd?style=plastic) ![GitHub](https://img.shields.io/github/license/WShihan/blblcd?style=plastic) ![GitHub top language](https://img.shields.io/github/languages/top/WShihan/blblcd?style=plastic)](https://github.com/WShihan/blblcd)
-
-**blblcd (Bilibili Comment Downloader)**：一款基于 [bilibili-API-collect](https://github.com/SocialSisterYi/bilibili-API-collect) 的B站视频评论下载命令行工具。
-
+*   **blblcd (Bilibili Comment Downloader)**：一款基于 [bilibili-API-collect](https://github.com/SocialSisterYi/bilibili-API-collect) 的B站视频评论下载命令行工具。
 *   🗂️ 仓库： [Codeberg](https://codeberg.org/wsh233/blblcd) | [GitHub](https://github.com/WShihan/blblcd)
 *   🎉 支持跨平台（Mac/Linux/Windows），可高效、快速地在终端下载并进行各种本地映射与统计。
 
