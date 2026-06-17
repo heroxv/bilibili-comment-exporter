@@ -1,14 +1,12 @@
 // ==UserScript==
 // @name         bilibili-comment-exporter
 // @namespace    https://github.com/heroxv/bilibili-comment-exporter
-// @version      0.1.9
+// @version      0.2.0
 // @description  一款基于 Bilibili API 的视频评论区导出工具，支持导出主评论和子评论（楼中楼）为 CSV 文件，带有 UTF-8 BOM 解决乱码，并有漂亮的玻璃质感 UI 和实时的 IP 属地、等级及性别数据统计图表。
 // @author       heroxv
 // @icon         https://github.com/heroxv/bilibili-comment-exporter/raw/main/assets/logo.svg
-// @match        *://*.bilibili.com/video/BV*
-// @match        *://*.bilibili.com/video/av*
+// @match        *://*.bilibili.com/video/*
 // @match        *://space.bilibili.com/*
-// @match        *://www.bilibili.com/video/*
 // @grant        none
 // @run-at       document-end
 // ==/UserScript==
@@ -271,74 +269,130 @@
     }
 
     // ==========================================
+    // 3.5 Network Utilities (Timeout + Retry)
+    // ==========================================
+    const FETCH_TIMEOUT_MS = 15000; // 15 seconds
+    const MAX_RETRIES = 3;
+
+    function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        return fetch(url, { ...options, signal: controller.signal })
+            .then(response => { clearTimeout(timer); return response; })
+            .catch(err => {
+                clearTimeout(timer);
+                if (err.name === 'AbortError') {
+                    throw new Error(`请求超时 (${timeoutMs / 1000}s)`);
+                }
+                throw err;
+            });
+    }
+
+    async function retryFetch(fetchFn, retries = MAX_RETRIES) {
+        let lastError;
+        for (let attempt = 1; attempt <= retries; attempt++) {
+            try {
+                return await fetchFn();
+            } catch (err) {
+                lastError = err;
+                if (attempt < retries) {
+                    const backoffMs = Math.min(1000 * Math.pow(2, attempt - 1), 8000);
+                    await new Promise(r => setTimeout(r, backoffMs));
+                }
+            }
+        }
+        throw lastError;
+    }
+
+    // ==========================================
+    // 3.6 Wbi Key Cache (5-min TTL)
+    // ==========================================
+    let cachedWbiKeys = null;
+    let wbiKeysCachedAt = 0;
+    const WBI_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+    async function getCachedWbiKeys() {
+        const now = Date.now();
+        if (cachedWbiKeys && (now - wbiKeysCachedAt) < WBI_CACHE_TTL_MS) {
+            return cachedWbiKeys;
+        }
+        const keys = await getWbiKeys();
+        cachedWbiKeys = keys;
+        wbiKeysCachedAt = now;
+        return keys;
+    }
+
+    // ==========================================
     // 4. API Client Integration
     // ==========================================
-    let wbiKeyCache = null;
-
-    async function getWbiKeys(forceRefresh = false) {
-        if (!forceRefresh && wbiKeyCache && Date.now() < wbiKeyCache.expiresAt) {
-            return { imgKey: wbiKeyCache.imgKey, subKey: wbiKeyCache.subKey };
-        }
-        const response = await fetch('https://api.bilibili.com/x/web-interface/nav', { credentials: 'include' });
-        const json = await response.json();
-        if (json.code !== 0) {
-            throw new Error(`获取 Wbi Key 失败: ${json.message}`);
-        }
-        const imgUrl = json.data.wbi_img.img_url;
-        const subUrl = json.data.wbi_img.sub_url;
-        const imgKey = imgUrl.split('/').pop().split('.')[0];
-        const subKey = subUrl.split('/').pop().split('.')[0];
-        wbiKeyCache = { imgKey, subKey, expiresAt: Date.now() + 30 * 60 * 1000 };
-        return { imgKey, subKey };
+    async function getWbiKeys() {
+        return retryFetch(async () => {
+            const response = await fetchWithTimeout('https://api.bilibili.com/x/web-interface/nav', { credentials: 'include' });
+            const json = await response.json();
+            if (json.code !== 0) {
+                throw new Error(`获取 Wbi Key 失败: ${json.message}`);
+            }
+            const imgUrl = json.data.wbi_img.img_url;
+            const subUrl = json.data.wbi_img.sub_url;
+            const imgKey = imgUrl.split('/').pop().split('.')[0];
+            const subKey = subUrl.split('/').pop().split('.')[0];
+            return { imgKey, subKey };
+        });
     }
 
     async function fetchCommentsPage(oid, mode, paginationStr, imgKey, subKey) {
-        const baseUrl = 'https://api.bilibili.com/x/v2/reply/wbi/main';
-        let paginationStrParam = '{"offset":""}';
-        if (paginationStr) {
-            paginationStrParam = JSON.stringify({ offset: paginationStr });
-        }
-        const params = {
-            oid: oid,
-            type: 1,
-            mode: mode, // 2 = time, 3 = hot
-            pagination_str: paginationStrParam,
-            plat: 1,
-            seek_rpid: '',
-            web_location: '1315875'
-        };
-        const signedUrl = signWbiUrl(baseUrl, params, imgKey, subKey);
-        const response = await fetch(signedUrl, { credentials: 'include' });
-        return await response.json();
+        return retryFetch(async () => {
+            const baseUrl = 'https://api.bilibili.com/x/v2/reply/wbi/main';
+            let paginationStrParam = '{"offset":""}';
+            if (paginationStr) {
+                paginationStrParam = JSON.stringify({ offset: paginationStr });
+            }
+            const params = {
+                oid: oid,
+                type: 1,
+                mode: mode, // 2 = time, 3 = hot
+                pagination_str: paginationStrParam,
+                plat: 1,
+                seek_rpid: '',
+                web_location: '1315875'
+            };
+            const signedUrl = signWbiUrl(baseUrl, params, imgKey, subKey);
+            const response = await fetchWithTimeout(signedUrl, { credentials: 'include' });
+            return await response.json();
+        });
     }
 
     async function fetchSubCommentsPage(oid, rootRpid, pageNum) {
-        const params = new URLSearchParams({
-            oid: oid,
-            type: '1',
-            root: rootRpid.toString(),
-            ps: '20',
-            pn: pageNum.toString(),
-            web_location: '333.788'
+        return retryFetch(async () => {
+            const params = new URLSearchParams({
+                oid: oid,
+                type: '1',
+                root: rootRpid.toString(),
+                ps: '20',
+                pn: pageNum.toString(),
+                web_location: '333.788'
+            });
+            const url = `https://api.bilibili.com/x/v2/reply/reply?${params.toString()}`;
+            const response = await fetchWithTimeout(url, { credentials: 'include' });
+            return await response.json();
         });
-        const url = `https://api.bilibili.com/x/v2/reply/reply?${params.toString()}`;
-        const response = await fetch(url, { credentials: 'include' });
-        return await response.json();
     }
 
     async function fetchUpVideosPage(mid, pageNum, order, imgKey, subKey) {
-        const baseUrl = 'https://api.bilibili.com/x/space/wbi/arc/search';
-        const params = {
-            mid: mid,
-            order: order, // 'pubdate', 'click', 'stow'
-            platform: 'web',
-            pn: pageNum,
-            ps: '30',
-            tid: '0'
-        };
-        const signedUrl = signWbiUrl(baseUrl, params, imgKey, subKey);
-        const response = await fetch(signedUrl, { credentials: 'include' });
-        return await response.json();
+        return retryFetch(async () => {
+            const baseUrl = 'https://api.bilibili.com/x/space/wbi/arc/search';
+            const params = {
+                mid: mid,
+                order: order, // 'pubdate', 'click', 'stow'
+                platform: 'web',
+                pn: pageNum,
+                ps: '30',
+                tid: '0'
+            };
+            const signedUrl = signWbiUrl(baseUrl, params, imgKey, subKey);
+            const response = await fetchWithTimeout(signedUrl, { credentials: 'include' });
+            return await response.json();
+        });
     }
 
     // ==========================================
@@ -982,6 +1036,27 @@
             font-size: 9px;
             color: var(--text-sub);
         }
+
+        /* Drag handle on header */
+        .bili-cmt-header {
+            cursor: grab;
+        }
+        .bili-cmt-header:active {
+            cursor: grabbing;
+        }
+
+        /* Duration badge */
+        .dash-duration {
+            font-size: 11px;
+            color: var(--text-sub);
+            font-weight: 600;
+            text-align: center;
+            padding: 4px 0;
+        }
+        .dash-duration span {
+            color: var(--bili-pink);
+            font-weight: 700;
+        }
     `;
 
     // ==========================================
@@ -1003,12 +1078,29 @@
         }
 
         const headers = ["bvid", "upname", "sex", "content", "pictures", "rpid", "oid", "mid", "parent", "fans_grade", "ctime", "like", "level", "location"];
-        const rows = comments.map(cmt => [
-            cmt.bvid, cmt.upname, cmt.sex, cmt.content, cmt.pictures,
-            cmt.rpid, cmt.oid, cmt.mid, cmt.parent, cmt.fans_grade,
-            cmt.ctime, cmt.like, cmt.level, cmt.location
-        ].map(val => escapeCSVField(val)).join(','));
-        const csvContent = headers.join(',') + '\r\n' + rows.join('\r\n') + '\r\n';
+        const csvLines = [headers.join(',')];
+
+        for (const cmt of comments) {
+            const row = [
+                cmt.bvid,
+                cmt.upname,
+                cmt.sex,
+                cmt.content,
+                cmt.pictures,
+                cmt.rpid,
+                cmt.oid,
+                cmt.mid,
+                cmt.parent,
+                cmt.fans_grade,
+                cmt.ctime,
+                cmt.like,
+                cmt.level,
+                cmt.location
+            ];
+            csvLines.push(row.map(val => escapeCSVField(val)).join(','));
+        }
+
+        const csvContent = csvLines.join('\r\n') + '\r\n';
 
         // Add UTF-8 BOM to solve Excel encoding issues (中文乱码)
         const blob = new Blob(['\uFEFF' + csvContent], { type: 'text/csv;charset=utf-8;' });
@@ -1020,7 +1112,8 @@
         document.body.appendChild(link);
         link.click();
         document.body.removeChild(link);
-        URL.revokeObjectURL(url);
+        // Delay revokeObjectURL to ensure browser has time to trigger the download
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
     }
 
     function sanitizeFilename(name) {
@@ -1148,36 +1241,34 @@
     // ==========================================
     let isExporting = false;
     let shouldCancel = false;
+    let exportStartTime = 0;
     const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
     const LOG_MAX_LINES = 200;
 
     let currentExportedComments = [];
     let currentFilename = "";
 
-    let progressUpdatePending = false;
-    let lastProgressData = null;
+    // Throttled progress DOM update (max once per 500ms)
+    let lastProgressUpdate = 0;
+    function throttledProgressUpdate(stats, totalCount) {
+        const now = Date.now();
+        if (now - lastProgressUpdate < 500) return;
+        lastProgressUpdate = now;
 
-    function updateProgressUI(stats, totalCount) {
-        lastProgressData = { stats, totalCount };
-        if (progressUpdatePending) return;
-        progressUpdatePending = true;
-        requestAnimationFrame(() => {
-            progressUpdatePending = false;
-            if (!lastProgressData) return;
-            const { stats: s, totalCount: total } = lastProgressData;
-            const totalFetched = s.main + s.sub;
-            const statsMain = document.getElementById('stats-main');
-            const statsSub = document.getElementById('stats-sub');
-            const progressSpeed = document.getElementById('progress-speed');
-            const progressBar = document.getElementById('progress-bar-fill');
-            if (statsMain) statsMain.innerText = s.main;
-            if (statsSub) statsSub.innerText = s.sub;
-            if (progressSpeed) progressSpeed.innerText = `进度: ${totalFetched} / ${total}`;
-            if (progressBar) {
-                const pct = total > 0 ? Math.min(100, Math.round((totalFetched / total) * 100)) : 50;
-                progressBar.style.width = `${pct}%`;
-            }
-        });
+        const totalFetched = stats.main + stats.sub;
+        const mainEl = document.getElementById('stats-main');
+        const subEl = document.getElementById('stats-sub');
+        const speedEl = document.getElementById('progress-speed');
+        const barEl = document.getElementById('progress-bar-fill');
+
+        if (mainEl) mainEl.innerText = stats.main;
+        if (subEl) subEl.innerText = stats.sub;
+        if (speedEl) speedEl.innerText = `进度: ${totalFetched} / ${totalCount}`;
+
+        if (barEl) {
+            const pct = totalCount > 0 ? Math.min(100, Math.round((totalFetched / totalCount) * 100)) : 50;
+            barEl.style.width = `${pct}%`;
+        }
     }
 
     function log(msg, type = 'info') {
@@ -1258,19 +1349,14 @@
         let stats = createEmptyStats();
 
         let imgKey, subKey;
-        if (wbiKeys && wbiKeys.imgKey && wbiKeys.subKey) {
-            imgKey = wbiKeys.imgKey;
-            subKey = wbiKeys.subKey;
-        } else {
-            try {
-                log('正在解析 Wbi Key...', 'info');
-                const keys = await getWbiKeys();
-                imgKey = keys.imgKey;
-                subKey = keys.subKey;
-                log('Wbi Key 解析成功。', 'success');
-            } catch (e) {
-                log(`获取 Wbi Key 失败: ${e.message}，将直接请求可能受限的 API。`, 'warn');
-            }
+        try {
+            log('正在解析 Wbi Key...', 'info');
+            const keys = await getCachedWbiKeys();
+            imgKey = keys.imgKey;
+            subKey = keys.subKey;
+            log('Wbi Key 解析成功。', 'success');
+        } catch (e) {
+            log(`获取 Wbi Key 失败: ${e.message}，将直接请求可能受限的 API。`, 'warn');
         }
 
         let paginationStr = '';
@@ -1323,8 +1409,8 @@
             for (const reply of currentReplies) {
                 if (shouldCancel) break;
 
-                if (rpidMap.has(reply.rpid)) continue;
-                rpidMap.add(reply.rpid);
+                if (rpidMap.has(String(reply.rpid))) continue;
+                rpidMap.add(String(reply.rpid));
                 hasNewComments = true;
 
                 const mainCmt = mapReplyItem(reply, bvid);
@@ -1336,8 +1422,8 @@
                 if (includeSub && reply.rcount > 0) {
                     if (reply.replies && reply.replies.length > 0 && reply.replies.length === reply.rcount) {
                         for (const subReply of reply.replies) {
-                            if (rpidMap.has(subReply.rpid)) continue;
-                            rpidMap.add(subReply.rpid);
+                            if (rpidMap.has(String(subReply.rpid))) continue;
+                            rpidMap.add(String(subReply.rpid));
 
                             const subCmt = mapReplyItem(subReply, bvid);
                             allComments.push(subCmt);
@@ -1366,8 +1452,8 @@
                             if (subReplies.length === 0) break;
 
                             for (const subReply of subReplies) {
-                                if (rpidMap.has(subReply.rpid)) continue;
-                                rpidMap.add(subReply.rpid);
+                                if (rpidMap.has(String(subReply.rpid))) continue;
+                                rpidMap.add(String(subReply.rpid));
 
                                 const subCmt = mapReplyItem(subReply, bvid);
                                 allComments.push(subCmt);
@@ -1400,7 +1486,8 @@
                 maxTryCount = 0;
             }
 
-            updateProgressUI(stats, totalCount);
+            // Update progress (throttled)
+            throttledProgressUpdate(stats, totalCount);
 
             if (shouldCancel) break;
 
@@ -1419,7 +1506,7 @@
         let imgKey, subKey;
         try {
             log('正在解析 Wbi Key...', 'info');
-            const keys = await getWbiKeys();
+            const keys = await getCachedWbiKeys();
             imgKey = keys.imgKey;
             subKey = keys.subKey;
             log('Wbi Key 解析成功。', 'success');
@@ -1515,6 +1602,27 @@
     // ==========================================
     // 9. Dashboard Visualization
     // ==========================================
+    function formatDuration(ms) {
+        const totalSec = Math.floor(ms / 1000);
+        const m = Math.floor(totalSec / 60);
+        const s = totalSec % 60;
+        if (m > 0) return `${m}分${s}秒`;
+        return `${s}秒`;
+    }
+
+    function sendDesktopNotification(title, body) {
+        if (!('Notification' in window)) return;
+        if (Notification.permission === 'granted') {
+            new Notification(title, { body, icon: 'https://github.com/heroxv/bilibili-comment-exporter/raw/main/assets/logo.svg' });
+        } else if (Notification.permission !== 'denied') {
+            Notification.requestPermission().then(perm => {
+                if (perm === 'granted') {
+                    new Notification(title, { body, icon: 'https://github.com/heroxv/bilibili-comment-exporter/raw/main/assets/logo.svg' });
+                }
+            });
+        }
+    }
+
     function displayStats(comments, stats, filename) {
         currentExportedComments = comments;
         currentFilename = filename;
@@ -1528,6 +1636,17 @@
         document.getElementById('dash-total').innerText = total;
         document.getElementById('dash-main').innerText = stats.main;
         document.getElementById('dash-sub').innerText = stats.sub;
+
+        // Show export duration
+        const durationRow = document.getElementById('dash-duration-row');
+        if (durationRow && exportStartTime > 0) {
+            const elapsed = Date.now() - exportStartTime;
+            durationRow.innerHTML = `✅ 导出完成，耗时 <span>${formatDuration(elapsed)}</span>，共 ${total} 条评论`;
+            durationRow.style.display = 'block';
+        }
+
+        // Desktop notification
+        sendDesktopNotification('bilibili-comment-exporter', `导出完成！共 ${total} 条评论。`);
 
         // Render IP locations Top 5
         const ipContainer = document.getElementById('chart-ip');
@@ -1655,7 +1774,7 @@
             <div class="bili-cmt-header">
                 <div class="bili-cmt-title-area">
                     <h3>B站评论区导出工具</h3>
-                    <span class="bili-cmt-subtitle">bilibili-comment-exporter v0.1.9</span>
+                    <span class="bili-cmt-subtitle">bilibili-comment-exporter v0.2.0</span>
                 </div>
                 <button id="bili-cmt-close-btn" class="bili-cmt-close-btn">&times;</button>
             </div>
@@ -1792,6 +1911,8 @@
                     <button id="dashboard-back-btn" class="bili-cmt-btn-text">返回设置</button>
                 </div>
                 
+                <div id="dash-duration-row" class="dash-duration" style="display:none;"></div>
+                
                 <div class="dashboard-summary-cards">
                     <div class="summary-card">
                         <span class="card-num" id="dash-total">0</span>
@@ -1876,8 +1997,17 @@
             downloadCSV(currentExportedComments, currentFilename);
         });
 
+        // Helper: enable/disable export buttons
+        function setExportButtonsEnabled(enabled) {
+            const videoBtn = document.getElementById('video-start-btn');
+            const upBtn = document.getElementById('up-start-btn');
+            if (videoBtn) { videoBtn.disabled = !enabled; videoBtn.style.opacity = enabled ? '1' : '0.5'; videoBtn.style.pointerEvents = enabled ? 'auto' : 'none'; }
+            if (upBtn) { upBtn.disabled = !enabled; upBtn.style.opacity = enabled ? '1' : '0.5'; upBtn.style.pointerEvents = enabled ? 'auto' : 'none'; }
+        }
+
         // Start Video Export
         document.getElementById('video-start-btn').addEventListener('click', async () => {
+            if (isExporting) return;
             const bvidVal = document.getElementById('video-bvid').value;
             const parsed = parseOidInput(bvidVal);
             if (!parsed) {
@@ -1900,10 +2030,13 @@
 
             isExporting = true;
             shouldCancel = false;
+            exportStartTime = Date.now();
+            setExportButtonsEnabled(false);
 
             try {
                 const result = await exportVideoComments(parsed.oid, parsed.bvid, mode, includeSub, limit, delayVal);
                 isExporting = false;
+                setExportButtonsEnabled(true);
 
                 if (shouldCancel) {
                     log('导出已被取消。', 'warn');
@@ -1916,12 +2049,14 @@
                 }
             } catch (err) {
                 isExporting = false;
+                setExportButtonsEnabled(true);
                 log(`发生严重错误: ${err.message}`, 'error');
             }
         });
 
         // Start UP space batch export
         document.getElementById('up-start-btn').addEventListener('click', async () => {
+            if (isExporting) return;
             const midVal = document.getElementById('up-mid').value;
             const mid = parseMidInput(midVal);
             if (!mid) {
@@ -1945,10 +2080,13 @@
 
             isExporting = true;
             shouldCancel = false;
+            exportStartTime = Date.now();
+            setExportButtonsEnabled(false);
 
             try {
                 const result = await exportUpComments(mid, pages, skip, includeSub, limit, delayVal);
                 isExporting = false;
+                setExportButtonsEnabled(true);
 
                 if (shouldCancel) {
                     log('批量导出已被取消。', 'warn');
@@ -1961,8 +2099,39 @@
                 }
             } catch (err) {
                 isExporting = false;
+                setExportButtonsEnabled(true);
                 log(`批量导出发生严重错误: ${err.message}`, 'error');
             }
+        });
+
+        // Panel Drag Functionality
+        const header = panel.querySelector('.bili-cmt-header');
+        let isDragging = false;
+        let dragOffsetX = 0;
+        let dragOffsetY = 0;
+
+        header.addEventListener('mousedown', (e) => {
+            // Don't drag if clicking the close button
+            if (e.target.closest('.bili-cmt-close-btn')) return;
+            isDragging = true;
+            const rect = panel.getBoundingClientRect();
+            dragOffsetX = e.clientX - rect.left;
+            dragOffsetY = e.clientY - rect.top;
+            e.preventDefault();
+        });
+
+        document.addEventListener('mousemove', (e) => {
+            if (!isDragging) return;
+            const newLeft = Math.max(0, Math.min(window.innerWidth - 100, e.clientX - dragOffsetX));
+            const newTop = Math.max(0, Math.min(window.innerHeight - 100, e.clientY - dragOffsetY));
+            panel.style.left = newLeft + 'px';
+            panel.style.top = newTop + 'px';
+            panel.style.right = 'auto';
+            panel.style.bottom = 'auto';
+        });
+
+        document.addEventListener('mouseup', () => {
+            isDragging = false;
         });
 
         // Initialize state
