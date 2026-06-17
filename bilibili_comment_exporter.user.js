@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         bilibili-comment-exporter
 // @namespace    https://github.com/heroxv/bilibili-comment-exporter
-// @version      0.1.8
+// @version      0.1.9
 // @description  一款基于 Bilibili API 的视频评论区导出工具，支持导出主评论和子评论（楼中楼）为 CSV 文件，带有 UTF-8 BOM 解决乱码，并有漂亮的玻璃质感 UI 和实时的 IP 属地、等级及性别数据统计图表。
 // @author       heroxv
 // @icon         https://github.com/heroxv/bilibili-comment-exporter/raw/main/assets/logo.svg
@@ -273,7 +273,12 @@
     // ==========================================
     // 4. API Client Integration
     // ==========================================
-    async function getWbiKeys() {
+    let wbiKeyCache = null;
+
+    async function getWbiKeys(forceRefresh = false) {
+        if (!forceRefresh && wbiKeyCache && Date.now() < wbiKeyCache.expiresAt) {
+            return { imgKey: wbiKeyCache.imgKey, subKey: wbiKeyCache.subKey };
+        }
         const response = await fetch('https://api.bilibili.com/x/web-interface/nav', { credentials: 'include' });
         const json = await response.json();
         if (json.code !== 0) {
@@ -283,6 +288,7 @@
         const subUrl = json.data.wbi_img.sub_url;
         const imgKey = imgUrl.split('/').pop().split('.')[0];
         const subKey = subUrl.split('/').pop().split('.')[0];
+        wbiKeyCache = { imgKey, subKey, expiresAt: Date.now() + 30 * 60 * 1000 };
         return { imgKey, subKey };
     }
 
@@ -997,28 +1003,12 @@
         }
 
         const headers = ["bvid", "upname", "sex", "content", "pictures", "rpid", "oid", "mid", "parent", "fans_grade", "ctime", "like", "level", "location"];
-        let csvContent = headers.join(',') + '\r\n';
-
-        for (const cmt of comments) {
-            const row = [
-                cmt.bvid,
-                cmt.upname,
-                cmt.sex,
-                cmt.content,
-                cmt.pictures,
-                cmt.rpid,
-                cmt.oid,
-                cmt.mid,
-                cmt.parent,
-                cmt.fans_grade,
-                cmt.ctime,
-                cmt.like,
-                cmt.level,
-                cmt.location
-            ];
-            const escapedRow = row.map(val => escapeCSVField(val));
-            csvContent += escapedRow.join(',') + '\r\n';
-        }
+        const rows = comments.map(cmt => [
+            cmt.bvid, cmt.upname, cmt.sex, cmt.content, cmt.pictures,
+            cmt.rpid, cmt.oid, cmt.mid, cmt.parent, cmt.fans_grade,
+            cmt.ctime, cmt.like, cmt.level, cmt.location
+        ].map(val => escapeCSVField(val)).join(','));
+        const csvContent = headers.join(',') + '\r\n' + rows.join('\r\n') + '\r\n';
 
         // Add UTF-8 BOM to solve Excel encoding issues (中文乱码)
         const blob = new Blob(['\uFEFF' + csvContent], { type: 'text/csv;charset=utf-8;' });
@@ -1159,9 +1149,36 @@
     let isExporting = false;
     let shouldCancel = false;
     const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+    const LOG_MAX_LINES = 200;
 
     let currentExportedComments = [];
     let currentFilename = "";
+
+    let progressUpdatePending = false;
+    let lastProgressData = null;
+
+    function updateProgressUI(stats, totalCount) {
+        lastProgressData = { stats, totalCount };
+        if (progressUpdatePending) return;
+        progressUpdatePending = true;
+        requestAnimationFrame(() => {
+            progressUpdatePending = false;
+            if (!lastProgressData) return;
+            const { stats: s, totalCount: total } = lastProgressData;
+            const totalFetched = s.main + s.sub;
+            const statsMain = document.getElementById('stats-main');
+            const statsSub = document.getElementById('stats-sub');
+            const progressSpeed = document.getElementById('progress-speed');
+            const progressBar = document.getElementById('progress-bar-fill');
+            if (statsMain) statsMain.innerText = s.main;
+            if (statsSub) statsSub.innerText = s.sub;
+            if (progressSpeed) progressSpeed.innerText = `进度: ${totalFetched} / ${total}`;
+            if (progressBar) {
+                const pct = total > 0 ? Math.min(100, Math.round((totalFetched / total) * 100)) : 50;
+                progressBar.style.width = `${pct}%`;
+            }
+        });
+    }
 
     function log(msg, type = 'info') {
         const consoleDiv = document.getElementById('console-log');
@@ -1172,7 +1189,20 @@
         const timeStr = new Date().toTimeString().split(' ')[0];
         line.innerText = `[${timeStr}] ${msg}`;
         consoleDiv.appendChild(line);
+        while (consoleDiv.children.length > LOG_MAX_LINES) {
+            consoleDiv.removeChild(consoleDiv.firstChild);
+        }
         consoleDiv.scrollTop = consoleDiv.scrollHeight;
+    }
+
+    function createEmptyStats() {
+        return {
+            main: 0,
+            sub: 0,
+            ip: {},
+            level: {1:0, 2:0, 3:0, 4:0, 5:0, 6:0},
+            sex: { '男': 0, '女': 0, '保密': 0 }
+        };
     }
 
     function mapReplyItem(item, bvid) {
@@ -1221,26 +1251,26 @@
         }
     }
 
-    async function exportVideoComments(oid, bvid, mode, includeSub, limit, requestDelay) {
+    async function exportVideoComments(oid, bvid, mode, includeSub, limit, requestDelay, options = {}) {
+        const { stopOnLimit = true, wbiKeys = null } = options;
         let allComments = [];
         let rpidMap = new Set();
-        let stats = {
-            main: 0,
-            sub: 0,
-            ip: {},
-            level: {1:0, 2:0, 3:0, 4:0, 5:0, 6:0},
-            sex: { '男': 0, '女': 0, '保密': 0 }
-        };
+        let stats = createEmptyStats();
 
         let imgKey, subKey;
-        try {
-            log('正在解析 Wbi Key...', 'info');
-            const keys = await getWbiKeys();
-            imgKey = keys.imgKey;
-            subKey = keys.subKey;
-            log('Wbi Key 解析成功。', 'success');
-        } catch (e) {
-            log(`获取 Wbi Key 失败: ${e.message}，将直接请求可能受限的 API。`, 'warn');
+        if (wbiKeys && wbiKeys.imgKey && wbiKeys.subKey) {
+            imgKey = wbiKeys.imgKey;
+            subKey = wbiKeys.subKey;
+        } else {
+            try {
+                log('正在解析 Wbi Key...', 'info');
+                const keys = await getWbiKeys();
+                imgKey = keys.imgKey;
+                subKey = keys.subKey;
+                log('Wbi Key 解析成功。', 'success');
+            } catch (e) {
+                log(`获取 Wbi Key 失败: ${e.message}，将直接请求可能受限的 API。`, 'warn');
+            }
         }
 
         let paginationStr = '';
@@ -1270,7 +1300,7 @@
             if (round === 1) {
                 totalCount = cmtInfo.data.cursor.all_count || 0;
                 log(`该视频总计约 ${totalCount} 条评论（包含子评论）。`, 'info');
-                document.getElementById('progress-speed').innerText = `进度: 0 / ${totalCount}`;
+                updateProgressUI(stats, totalCount);
             }
 
             const replies = cmtInfo.data.replies || [];
@@ -1317,7 +1347,9 @@
                     } else {
                         let subPage = 1;
                         while (isExporting && !shouldCancel) {
-                            log(`  正在抓取主评论 ${reply.rpid} 的子评论第 ${subPage} 页...`, 'info');
+                            if (subPage === 1 || subPage % 5 === 0) {
+                                log(`  正在抓取主评论 ${reply.rpid} 的子评论第 ${subPage} 页...`, 'info');
+                            }
                             await delay(requestDelay);
 
                             let subInfo;
@@ -1352,7 +1384,7 @@
                 mainCountFetched++;
                 if (limit && mainCountFetched >= limit) {
                     log(`已达到设定的主评论获取上限 (${limit}条)。`, 'warn');
-                    shouldCancel = true;
+                    if (stopOnLimit) shouldCancel = true;
                     break;
                 }
             }
@@ -1368,14 +1400,7 @@
                 maxTryCount = 0;
             }
 
-            // Update progress
-            const totalFetched = stats.main + stats.sub;
-            document.getElementById('stats-main').innerText = stats.main;
-            document.getElementById('stats-sub').innerText = stats.sub;
-            document.getElementById('progress-speed').innerText = `进度: ${totalFetched} / ${totalCount}`;
-
-            const pct = totalCount > 0 ? Math.min(100, Math.round((totalFetched / totalCount) * 100)) : 50;
-            document.getElementById('progress-bar-fill').style.width = `${pct}%`;
+            updateProgressUI(stats, totalCount);
 
             if (shouldCancel) break;
 
@@ -1440,13 +1465,7 @@
         log(`共成功获取到 ${videos.length} 个视频。准备启动批量导出评论...`, 'success');
 
         let allComments = [];
-        let stats = {
-            main: 0,
-            sub: 0,
-            ip: {},
-            level: {1:0, 2:0, 3:0, 4:0, 5:0, 6:0},
-            sex: { '男': 0, '女': 0, '保密': 0 }
-        };
+        let stats = createEmptyStats();
 
         const totalVideos = videos.length;
         for (let i = 0; i < totalVideos; i++) {
@@ -1456,13 +1475,16 @@
             log(`[视频 ${i+1}/${totalVideos}] 正在导出: ${video.title} (BVID: ${video.bvid})`, 'info');
 
             try {
+                const exportOpts = { stopOnLimit: false };
+                if (imgKey && subKey) exportOpts.wbiKeys = { imgKey, subKey };
                 const result = await exportVideoComments(
                     video.aid.toString(),
                     video.bvid,
                     3, // hot order for UP list videos
                     includeSub,
                     limitPerVideo,
-                    requestDelay
+                    requestDelay,
+                    exportOpts
                 );
 
                 allComments.push(...result.allComments);
@@ -1633,7 +1655,7 @@
             <div class="bili-cmt-header">
                 <div class="bili-cmt-title-area">
                     <h3>B站评论区导出工具</h3>
-                    <span class="bili-cmt-subtitle">bilibili-comment-exporter v0.1.8</span>
+                    <span class="bili-cmt-subtitle">bilibili-comment-exporter v0.1.9</span>
                 </div>
                 <button id="bili-cmt-close-btn" class="bili-cmt-close-btn">&times;</button>
             </div>
@@ -1998,12 +2020,21 @@
     // ==========================================
     createUI();
 
-    let currentUrl = location.href;
-    setInterval(() => {
-        if (location.href !== currentUrl) {
-            currentUrl = location.href;
-            handleUrlChange();
-        }
-    }, 2000);
+    function watchUrlChanges() {
+        const notify = () => handleUrlChange();
+        const origPushState = history.pushState;
+        const origReplaceState = history.replaceState;
+        history.pushState = function(...args) {
+            origPushState.apply(this, args);
+            notify();
+        };
+        history.replaceState = function(...args) {
+            origReplaceState.apply(this, args);
+            notify();
+        };
+        window.addEventListener('popstate', notify);
+    }
+
+    watchUrlChanges();
 
 })();
